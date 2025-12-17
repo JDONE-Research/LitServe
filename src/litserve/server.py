@@ -315,85 +315,51 @@ class BaseRequestHandler(ABC):
 
 class RegularRequestHandler(BaseRequestHandler):
     async def handle_request(self, request, request_type) -> Response:
-        try:
-            logger.debug(f"Handling request: {request}")
-            # Prepare request
-            payload = await self._prepare_request(request, request_type)
+        logger.debug(f"Handling request: {request}")
+        # Prepare request
+        payload = await self._prepare_request(request, request_type)
 
-            # Submit to worker
-            uid, _ = await self._submit_request(payload)
+        # Submit to worker
+        uid, _ = await self._submit_request(payload)
 
-            # Wait for response
-            event = asyncio.Event()
-            self.server.response_buffer[uid] = ResponseBufferItem(event)
+        # Wait for response
+        event = asyncio.Event()
+        self.server.response_buffer[uid] = ResponseBufferItem(event)
 
-            await event.wait()
+        await event.wait()
 
-            # Process response
-            response_buffer_item = self.server.response_buffer.pop(uid)
-            response, status = response_buffer_item.response
+        # Process response
+        response_buffer_item = self.server.response_buffer.pop(uid)
+        response, status = response_buffer_item.response
 
-            if status == LitAPIStatus.ERROR:
-                self._handle_error_response(response)
+        # Trigger callback
+        self.server._callback_runner.trigger_event(EventTypes.ON_RESPONSE.value, litserver=self.server)
 
-            # Trigger callback
-            self.server._callback_runner.trigger_event(EventTypes.ON_RESPONSE.value, litserver=self.server)
-
-            return response
-
-        except HTTPException as e:
-            raise e from None
-
-        except Exception as e:
-            logger.error(f"Unhandled exception: {e}", exc_info=True)
-            raise HTTPException(status_code=500, detail="Internal server error") from e
-
-    @staticmethod
-    def _handle_error_response(response):
-        """Raise HTTPException as is and rest as 500 after logging the error."""
-        try:
-            if isinstance(response, bytes):
-                response = pickle.loads(response)
-                raise HTTPException(status_code=response.status_code, detail=response.detail)
-        except Exception as e:
-            logger.debug(f"couldn't unpickle error response {e}")
-
-        if isinstance(response, HTTPException):
-            raise response
-
-        if isinstance(response, Exception):
-            logger.error(f"Error while handling request: {response}")
-
-        raise HTTPException(status_code=500, detail="Internal server error")
+        return response
 
 
 class StreamingRequestHandler(BaseRequestHandler):
     async def handle_request(self, request, request_type) -> StreamingResponse:
-        try:
-            # Prepare request
-            payload = await self._prepare_request(request, request_type)
+        # Prepare request
+        payload = await self._prepare_request(request, request_type)
 
-            # Submit to worker
-            uid, _ = await self._submit_request(payload)
+        # Submit to worker
+        uid, _ = await self._submit_request(payload)
 
-            # Set up streaming response
-            event = asyncio.Event()
-            response_queue = deque()
-            self.server.response_buffer[uid] = ResponseBufferItem(event=event, response_queue=response_queue)
+        # Set up streaming response
+        event = asyncio.Event()
+        response_queue = deque()
+        self.server.response_buffer[uid] = ResponseBufferItem(event=event, response_queue=response_queue)
 
-            # Create streaming response
-            response_generator = call_after_stream(
-                self.server.data_streamer(response_queue, data_available=event),
-                self.server._callback_runner.trigger_event,
-                EventTypes.ON_RESPONSE.value,
-                litserver=self.server,
-            )
+        # Create streaming response
+        response_generator = call_after_stream(
+            self.server.data_streamer(response_queue, data_available=event),
+            self.server._callback_runner.trigger_event,
+            EventTypes.ON_RESPONSE.value,
+            litserver=self.server,
+        )
 
-            return StreamingResponse(response_generator)
-
-        except Exception as e:
-            logger.exception(f"Error handling streaming request: {e}")
-            raise HTTPException(status_code=500, detail="Internal server error")
+        return StreamingResponse(response_generator)
 
 
 class _Server(uvicorn.server.Server):
@@ -666,6 +632,9 @@ class LitServer:
         healthcheck_path: str = "/health",
         info_path: str = "/info",
         shutdown_path: str = "/shutdown",
+        enable_index_api: bool = True,
+        enable_healthcheck_api: bool = True,
+        enable_info_api: bool = True,
         enable_shutdown_api: bool = False,
         model_metadata: Optional[dict] = None,
         spec: Optional[LitSpec] = None,
@@ -676,6 +645,7 @@ class LitServer:
         loggers: Optional[Union[Logger, list[Logger]]] = None,
         fast_queue: bool = False,
         disable_openapi_url: bool = False,
+        fastapi_config: Optional[dict] = None,
         # All the following arguments are deprecated and will be removed in v0.3.0
         max_batch_size: Optional[int] = None,
         batch_timeout: float = 0.0,
@@ -780,7 +750,12 @@ class LitServer:
         self.track_requests = track_requests
         self.timeout = timeout
         self.litapi_connector.set_request_timeout(timeout)
-        self.app = FastAPI(lifespan=self.lifespan, openapi_url="" if disable_openapi_url else "/openapi.json")
+        
+        # FastAPI configuration
+        _fastapi_config = fastapi_config or {}
+        _fastapi_config.setdefault("lifespan", self.lifespan)
+        _fastapi_config.setdefault("openapi_url", "" if disable_openapi_url else "/openapi.json")
+        self.app = FastAPI(**_fastapi_config)
         self._disable_openapi_url = disable_openapi_url
 
         self.app.response_queue_id = None
@@ -795,6 +770,9 @@ class LitServer:
         self._logger_connector = _LoggerConnector(self, loggers)
         self.logger_queue = None
         self.lit_api = lit_api
+        self.enable_index_api = enable_index_api
+        self.enable_healthcheck_api = enable_healthcheck_api
+        self.enable_info_api = enable_info_api
         self.enable_shutdown_api = enable_shutdown_api
         self.workers_per_device = workers_per_device
         self.max_payload_size = max_payload_size
@@ -974,47 +952,49 @@ class LitServer:
     def _register_internal_endpoints(self):
         workers_ready = False
 
-        @self.app.get("/", dependencies=[Depends(self.setup_auth())])
-        async def index(request: Request) -> Response:
-            return Response(content="litserve running")
+        if self.enable_index_api:
+            @self.app.get("/", dependencies=[Depends(self.setup_auth())])
+            async def index(request: Request) -> Response:
+                return Response(content="litserve running")
 
-        @self.app.get(self.healthcheck_path, dependencies=[Depends(self.setup_auth())])
-        async def health(request: Request) -> Response:
-            nonlocal workers_ready
-            if not workers_ready:
-                workers_ready = all(v == WorkerSetupStatus.READY for v in self.workers_setup_status.values())
+        if self.enable_healthcheck_api:
+            @self.app.get(self.healthcheck_path, dependencies=[Depends(self.setup_auth())])
+            async def health(request: Request) -> Response:
+                nonlocal workers_ready
+                if not workers_ready:
+                    workers_ready = all(v == WorkerSetupStatus.READY for v in self.workers_setup_status.values())
 
-            lit_api_health_status = True
-            for lit_api in self.litapi_connector:
-                result = lit_api.health()
-                if inspect.isawaitable(result):
-                    result = await result
-                if not result:
-                    lit_api_health_status = False
-                    break
-            if workers_ready and lit_api_health_status:
-                return Response(content="ok", status_code=200)
+                lit_api_health_status = True
+                for lit_api in self.litapi_connector:
+                    result = lit_api.health()
+                    if inspect.isawaitable(result):
+                        result = await result
+                    if not result:
+                        lit_api_health_status = False
+                        break
+                if workers_ready and lit_api_health_status:
+                    return Response(content="ok", status_code=200)
 
-            return Response(content="not ready", status_code=503)
+                return Response(content="not ready", status_code=503)
 
-        @self.app.get(self.info_path, dependencies=[Depends(self.setup_auth())])
-        async def info(request: Request) -> Response:
-            return JSONResponse(
-                content={
-                    "model": self.model_metadata,
-                    "server": {
-                        "devices": self.devices,
-                        "workers_per_device": self.workers_per_device,
-                        "timeout": self.timeout,
-                        "stream": {lit_api.api_path: lit_api.stream for lit_api in self.litapi_connector},
-                        "max_payload_size": self.max_payload_size,
-                        "track_requests": self.track_requests,
-                    },
-                }
-            )
+        if self.enable_info_api:
+            @self.app.get(self.info_path, dependencies=[Depends(self.setup_auth())])
+            async def info(request: Request) -> Response:
+                return JSONResponse(
+                    content={
+                        "model": self.model_metadata,
+                        "server": {
+                            "devices": self.devices,
+                            "workers_per_device": self.workers_per_device,
+                            "timeout": self.timeout,
+                            "stream": {lit_api.api_path: lit_api.stream for lit_api in self.litapi_connector},
+                            "max_payload_size": self.max_payload_size,
+                            "track_requests": self.track_requests,
+                        },
+                    }
+                )
 
         if self.enable_shutdown_api:
-
             @self.app.post(self._shutdown_path, dependencies=[Depends(self.shutdown_api_key_auth)])
             async def shutdown_endpoint():
                 if not self._shutdown_event:
