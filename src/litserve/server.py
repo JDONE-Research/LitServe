@@ -1397,9 +1397,6 @@ class LitServer:
                 port, num_api_servers, log_level, sockets, api_server_worker_type, **kwargs
             )
 
-            if not self._disable_openapi_url:
-                print(f"Swagger UI is available at http://0.0.0.0:{port}/docs")
-
             if self._monitor_workers:
                 self._start_worker_monitoring(manager, uvicorn_workers)
 
