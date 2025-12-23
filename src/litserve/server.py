@@ -56,6 +56,7 @@ from litserve.utils import (
     LitAPIStatus,
     LoopResponseType,
     ResponseBufferItem,
+    WorkerHealthStatus,
     WorkerSetupStatus,
     add_ssl_context_from_env,
     call_after_stream,
@@ -833,6 +834,7 @@ class LitServer:
                     self._get_request_queue(lit_api.api_path),
                     self._transport,
                     self.workers_setup_status,
+                    self.workers_health_status,
                     self._callback_runner,
                     self.restart_workers,
                 ),
@@ -868,6 +870,7 @@ class LitServer:
                 self._get_request_queue(lit_api.api_path),
                 self._transport,
                 self.workers_setup_status,
+                self.workers_health_status,
                 self._callback_runner,
                 self.restart_workers,
             ),
@@ -964,15 +967,14 @@ class LitServer:
                 if not workers_ready:
                     workers_ready = all(v == WorkerSetupStatus.READY for v in self.workers_setup_status.values())
 
-                lit_api_health_status = True
-                for lit_api in self.litapi_connector:
-                    result = lit_api.health()
-                    if inspect.isawaitable(result):
-                        result = await result
-                    if not result:
-                        lit_api_health_status = False
-                        break
-                if workers_ready and lit_api_health_status:
+                # Check worker health status from worker processes
+                workers_health_ok = True
+                if hasattr(self, 'workers_health_status') and self.workers_health_status:
+                    workers_health_ok = all(
+                        v == WorkerHealthStatus.HEALTHY for v in self.workers_health_status.values()
+                    )
+
+                if workers_ready and workers_health_ok:
                     return Response(content="ok", status_code=200)
 
                 return Response(content="not ready", status_code=503)
@@ -1095,6 +1097,7 @@ class LitServer:
         self.transport_config.manager = manager
         self.transport_config.num_consumers = num_api_servers
         self.workers_setup_status = manager.dict()
+        self.workers_health_status = manager.dict()
         self._shutdown_event = manager.Event()
 
         # create request queues for each unique lit_api api_path

@@ -142,6 +142,13 @@ class WorkerSetupStatus:
     FINISHED: str = "finished"
 
 
+@dataclasses.dataclass
+class WorkerHealthStatus:
+    HEALTHY: str = "healthy"
+    UNHEALTHY: str = "unhealthy"
+    UNKNOWN: str = "unknown"
+
+
 def _get_default_handler(stream, format):
     handler = logging.StreamHandler(stream)
     formatter = logging.Formatter(format)

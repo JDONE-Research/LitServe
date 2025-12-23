@@ -21,7 +21,7 @@ from litserve.loops.base import LitLoop, _BaseLoop
 from litserve.loops.simple_loops import BatchedLoop, SingleLoop
 from litserve.loops.streaming_loops import BatchedStreamingLoop, StreamingLoop
 from litserve.transport.base import MessageTransport
-from litserve.utils import WorkerSetupStatus
+from litserve.utils import WorkerHealthStatus, WorkerSetupStatus
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,7 @@ def inference_worker(
     request_queue: Queue,
     transport: MessageTransport,
     workers_setup_status: dict[int, str],
+    workers_health_status: dict[str, str],
     callback_runner: CallbackRunner,
     restart_workers: bool,
 ):
@@ -82,12 +83,24 @@ def inference_worker(
     except Exception:
         logger.exception(f"Error setting up worker {worker_id}.")
         workers_setup_status[f"{endpoint}_{worker_id}"] = WorkerSetupStatus.ERROR
+        workers_health_status[f"{endpoint}_{worker_id}"] = WorkerHealthStatus.UNHEALTHY
         return
     lit_api.device = device
     callback_runner.trigger_event(EventTypes.AFTER_SETUP.value, lit_api=lit_api)
 
     if workers_setup_status:
         workers_setup_status[f"{endpoint}_{worker_id}"] = WorkerSetupStatus.READY
+
+    # Perform health check after setup in worker process
+    try:
+        health_result = lit_api.health()
+        if health_result:
+            workers_health_status[f"{endpoint}_{worker_id}"] = WorkerHealthStatus.HEALTHY
+        else:
+            workers_health_status[f"{endpoint}_{worker_id}"] = WorkerHealthStatus.UNHEALTHY
+    except Exception:
+        logger.exception(f"Error during health check for worker {worker_id}.")
+        workers_health_status[f"{endpoint}_{worker_id}"] = WorkerHealthStatus.UNHEALTHY
 
     if lit_spec:
         logging.info(f"LitServe will use {lit_spec.__class__.__name__} spec")
