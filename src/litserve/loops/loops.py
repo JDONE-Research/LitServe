@@ -13,6 +13,8 @@
 # limitations under the License.
 import logging
 import os
+import threading
+import time
 from queue import Queue
 
 from litserve import LitAPI
@@ -24,6 +26,9 @@ from litserve.transport.base import MessageTransport
 from litserve.utils import WorkerHealthStatus, WorkerSetupStatus
 
 logger = logging.getLogger(__name__)
+
+# Default health check interval in seconds (1 minute cache)
+_DEFAULT_HEALTH_CHECK_INTERVAL = 60
 
 
 def get_default_loop(stream: bool, max_batch_size: int, enable_async: bool = False) -> _BaseLoop:
@@ -56,6 +61,48 @@ def get_default_loop(stream: bool, max_batch_size: int, enable_async: bool = Fal
     if max_batch_size > 1:
         return BatchedLoop()
     return SingleLoop()
+
+
+def _health_check_loop(
+    lit_api: LitAPI,
+    workers_health_status: dict[str, str],
+    endpoint: str,
+    worker_id: int,
+    interval: float = _DEFAULT_HEALTH_CHECK_INTERVAL,
+    stop_event: threading.Event = None,
+):
+    """Background thread that periodically checks health status.
+
+    Args:
+        lit_api: The LitAPI instance to check health for
+        workers_health_status: Shared dictionary to store health status
+        endpoint: The API endpoint name
+        worker_id: The worker ID
+        interval: Health check interval in seconds (default: 60s)
+        stop_event: Optional event to signal thread termination
+
+    """
+    worker_key = f"{endpoint}_{worker_id}"
+    while stop_event is None or not stop_event.is_set():
+        try:
+            health_result = lit_api.health()
+            if health_result:
+                workers_health_status[worker_key] = WorkerHealthStatus.HEALTHY
+            else:
+                workers_health_status[worker_key] = WorkerHealthStatus.UNHEALTHY
+                logger.warning(f"Worker {worker_id} health check returned unhealthy")
+        except Exception:
+            logger.exception(f"Error during periodic health check for worker {worker_id}.")
+            workers_health_status[worker_key] = WorkerHealthStatus.UNHEALTHY
+
+        # Sleep in small intervals to allow faster shutdown
+        sleep_interval = 1.0
+        elapsed = 0.0
+        while elapsed < interval:
+            if stop_event is not None and stop_event.is_set():
+                return
+            time.sleep(sleep_interval)
+            elapsed += sleep_interval
 
 
 def inference_worker(
@@ -91,7 +138,7 @@ def inference_worker(
     if workers_setup_status:
         workers_setup_status[f"{endpoint}_{worker_id}"] = WorkerSetupStatus.READY
 
-    # Perform health check after setup in worker process
+    # Perform initial health check after setup
     try:
         health_result = lit_api.health()
         if health_result:
@@ -101,6 +148,15 @@ def inference_worker(
     except Exception:
         logger.exception(f"Error during health check for worker {worker_id}.")
         workers_health_status[f"{endpoint}_{worker_id}"] = WorkerHealthStatus.UNHEALTHY
+
+    # Start background health check thread (runs every 60 seconds)
+    health_check_thread = threading.Thread(
+        target=_health_check_loop,
+        args=(lit_api, workers_health_status, endpoint, worker_id),
+        daemon=True,
+        name=f"health-check-{endpoint}-{worker_id}",
+    )
+    health_check_thread.start()
 
     if lit_spec:
         logging.info(f"LitServe will use {lit_spec.__class__.__name__} spec")
